@@ -1,0 +1,1070 @@
+#renewable powerplants----
+library(sf)
+library(terra)
+library(spatstat)
+library(tmap)
+library(dplyr)
+library(rgdal)
+library(gstat)
+#install.packages("readxl")
+library(readxl)
+wd="~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/"
+#read the powerplants 
+power<-read_excel("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/powerplants.xlsx")
+power.sf = st_as_sf(power, coords = c("longitude", "latitude"), crs=4326)
+tmap_mode("view")
+#indonesia
+indonesia = st_read(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/idn_admbnda_adm0_bps_20200401.shp" ))
+indonesia<-st_transform(indonesia,4326)
+power_indonesia <- st_filter(power.sf, indonesia)
+nrow(power_indonesia)
+tm_shape(indonesia)+tm_borders()+
+  tm_shape(power_indonesia)+tm_dots(size=0.01, col='capacity_mw')
+
+tm_shape(indonesia)+tm_borders()+
+  tm_shape(power_indonesia)+tm_dots(size=0.01, col='status')
+
+tm_shape(indonesia)+tm_borders()+
+  tm_shape(power_indonesia)+tm_dots(size=0.01, col='type')
+
+#irradiance over 2021----------
+
+#install.packages("ncdf4")
+library(ncdf4) #library to read and process netcdf data
+era <- nc_open(paste0(wd,"radiance.nc" ))
+era #3 variables [u10, v10, ssrd], 3 dimensions [longitude,latitude,time] 
+
+##Step 2. Extract dimensions
+#get Dimension :lon, lat, time
+lon <- ncvar_get(era, "longitude")
+
+lat <- ncvar_get(era, "latitude")
+time <- ncvar_get(era, "time")
+time
+dim(time)
+tunits <- ncatt_get(era,"time","units")
+#install.packages("chron")
+library(chron)
+#convert time -- split the time units string into fields
+tustr <- strsplit(tunits$value, " ") #strsplit: split the element of character vector. we can convert  "hours since 1900-01-01" to "hours"      "since"      "1900-01-01"
+tdstr <- strsplit(unlist(tustr)[3], "-") #convert "1900-01-01" to "1900" "01"   "01"
+tyear <- as.integer(unlist(tdstr)[1]) 
+tmonth <- as.integer(unlist(tdstr)[2])
+tday <- as.integer(unlist(tdstr)[3])
+chron(time/24, origin=c(tmonth, tday, tyear) ) #this function is of great help. It can convert the hours since format to the format we are quite familiar with.
+##Step 3. Extract variables
+#get Variables :u10,v10, ssrd. similar to get dimension data, we are going to use the same method, ncvar_get()
+ssrd_array <- ncvar_get(era,"ssrd") #get the Surface solar radiation downwards
+dim(ssrd_array) #dimension is 501 * 186 *8. Think about the Figure 1. The reason why it is called array is it is composed of 8 slices 
+dim(time)
+tunits <- ncatt_get(era,"time","units")
+dlname <- ncatt_get(era,"ssrd","long_name")
+dunits <- ncatt_get(era,"ssrd","units")
+fillvalue <- ncatt_get(era,"ssrd","_FillValue")
+##12pm data
+ssrd_slice<-ssrd_array[,,2]
+
+##Combine data and Visualise
+lonlat <- as.matrix( (expand.grid(lon, lat))) 
+dim(lonlat)
+ssrd_vec <- as.vector( ssrd_slice) 
+length(ssrd_vec)
+ssrd_df <- data.frame( cbind( lonlat,ssrd_vec  ))
+colnames(ssrd_df) <- c("lon", "lat", "ssrd")
+ssrd_df_value <- na.omit (ssrd_df)
+head(ssrd_df_value, 3) 
+
+#Creating a spatial object from a lat/lon table
+library(sf)
+ssrd_sf<- st_as_sf( ssrd_df_value, coords = c("lon", "lat")  ) 
+#To make it a complete geographical object we assign the WGS84 projection, which has the EPSG code 4326
+st_crs(ssrd_sf) <- 4326 
+ssrd_sf <- st_transform(ssrd_sf, 4326 )
+
+#idw-----
+library(gstat)
+library(rgdal)
+library(tmap)
+library(terra)
+coor = as.data.frame(st_coordinates(ssrd_sf))
+ssrd_sf$x = coor$X
+ssrd_sf$y = coor$Y
+ssrd_nogeom = st_drop_geometry(ssrd_sf)
+ssrd_nogeom=na.omit(ssrd_nogeom)
+gs <- gstat(formula=ssrd~1, locations=~x+y, data=ssrd_nogeom, nmax=Inf,set=list(idp=4)) 
+gs
+st_bbox(ssrd_sf)
+st_bbox(indonesia)
+raster_template = rast( resolution = 0.05,
+                        xmin=95.01079 , ymin=-11.00762  ,xmax=141.01940 , ymax=6.07693 ,  
+                        crs = st_crs(indonesia)$wkt)
+raster_template
+idw <- interpolate(raster_template, gs, debug.level=0) 
+idw_mask <- mask(idw, indonesia)
+names(idw_mask) = c( "Irradiance_level","observed" )
+
+#Visualising the interpolated results
+tmap_mode("view")
+tm_shape(idw_mask$Irradiance_level) + 
+  tm_raster(col="Irradiance_level", style = "quantile", n = 10, palette= "Reds", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+
+#Cross validation idp-----
+RMSE <- function(observed, Irradiance_level) {
+  sqrt(mean((Irradiance_level - observed)^2, na.rm=TRUE))
+}
+
+null <- RMSE(mean(ssrd_sf$ssrd), ssrd_sf$ssrd)
+null #2990478 is the baseline. 
+
+n_idp = 20 #examine power ranging from 1 to 20
+n_fold =10
+
+rmse <- rep(NA, n_fold) #generate 10 NA
+set.seed(7713)
+kf <- sample(1:n_fold, nrow(ssrd_nogeom), replace=TRUE)
+#View(kf)
+va = data.frame( c(1:n_idp), NA)
+colnames(va) =c("idp","rmse") 
+
+for (j in 1:n_idp) {
+  for (i in 1:n_fold) {
+    test <- ssrd_nogeom[kf == 1, ]
+    train <- ssrd_nogeom[kf != 1, ]
+    #Data corresponding to kf == 1 is assigned to the test set, 
+    #and data corresponding to kf != 1 is assigned to the training set.
+    gs <- gstat(formula=ssrd~1, locations=~x+y, data=train, nmax=Inf, set=list(idp=j))
+    #set=list(idp=j) specifying the idp value to test
+    pre = predict(gs, test, debug.level=0 )
+    rmse[i] <- RMSE(test$ssrd, pre$var1.pred)
+  }
+  va[j,2] = (mean(rmse) )
+}
+
+va[which(va$rmse==min(va)),]
+
+library(ggplot2)
+ggplot(va) +
+  geom_point(aes(x = idp, y= rmse))+
+  geom_hline(yintercept=min(va), linetype="dashed", color = "red")+
+  theme_classic()
+
+
+#irradiance to power output-------
+radiation_to_power <- function(G, A=12000000, r=0.175, p=0.6, hours=1,capacity_factor=0.2){
+  kWh <- G * A * r * p * capacity_factor*(hours/3600) / 1000
+  return(kWh)
+}
+idw <- interpolate(raster_template, gs, debug.level=0)
+Energy_mask <- mask(idw, indonesia)
+names(idw_mask) = c( "Irradiance_level","observed" )
+idw_mask_power <- app(idw_mask$Irradiance_level, radiation_to_power)
+raster::writeRaster(idw_mask_power, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/power_mask.tif", overwrite = TRUE)
+tmap_mode("view")
+names(idw_mask_power) <- "PowerOutput_kwh"
+tm_shape(idw_mask_power) + 
+  tm_raster(col="PowerOutput_kwh", style = "quantile", n = 10, palette= "Purples", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+#temperature--------
+library(ncdf4) #library to read and process netcdf data
+era <- nc_open(paste0(wd,"temperature.nc" ))
+era #3 variables [u10, v10, ssrd], 3 dimensions [longitude,latitude,time] 
+
+##Step 2. Extract dimensions
+#get Dimension :lon, lat, time
+lon <- ncvar_get(era, "longitude")
+lat <- ncvar_get(era, "latitude")
+time <- ncvar_get(era, "time")
+time
+dim(time)
+tunits <- ncatt_get(era,"time","units")
+#install.packages("chron")
+library(chron)
+#convert time -- split the time units string into fields
+tustr <- strsplit(tunits$value, " ") #strsplit: split the element of character vector. we can convert  "hours since 1900-01-01" to "hours"      "since"      "1900-01-01"
+tdstr <- strsplit(unlist(tustr)[3], "-") #convert "1900-01-01" to "1900" "01"   "01"
+tyear <- as.integer(unlist(tdstr)[1]) 
+tmonth <- as.integer(unlist(tdstr)[2])
+tday <- as.integer(unlist(tdstr)[3])
+chron(time/24, origin=c(tmonth, tday, tyear) ) #this function is of great help. It can convert the hours since format to the format we are quite familiar with.
+##Step 3. Extract variables
+#get Variables :u10,v10, ssrd. similar to get dimension data, we are going to use the same method, ncvar_get()
+ssrd_array <- ncvar_get(era,"t2m") #get the Surface solar radiation downwards
+dim(ssrd_array) #dimension is 501 * 186 *8. Think about the Figure 1. The reason why it is called array is it is composed of 8 slices 
+dim(time)
+tunits <- ncatt_get(era,"time","units")
+dlname <- ncatt_get(era,"t2m","long_name")
+dunits <- ncatt_get(era,"t2m","units")
+fillvalue <- ncatt_get(era,"t2m","_FillValue")
+##12pm data
+ssrd_slice<-ssrd_array[,,2]
+
+##Combine data and Visualise
+lonlat <- as.matrix( (expand.grid(lon, lat))) 
+dim(lonlat)
+ssrd_vec <- as.vector( ssrd_slice) 
+length(ssrd_vec)
+ssrd_df <- data.frame( cbind( lonlat,ssrd_vec  ))
+colnames(ssrd_df) <- c("lon", "lat", "t2m")
+ssrd_df_value <- na.omit (ssrd_df)
+head(ssrd_df_value, 3) 
+
+#Creating a spatial object from a lat/lon table
+library(sf)
+ssrd_sf<- st_as_sf( ssrd_df_value, coords = c("lon", "lat")  ) 
+#To make it a complete geographical object we assign the WGS84 projection, which has the EPSG code 4326
+st_crs(ssrd_sf) <- 4326 
+ssrd_sf <- st_transform(ssrd_sf, 4326 )
+
+
+
+#idw-------
+library(gstat)
+library(rgdal)
+library(tmap)
+library(terra)
+coor = as.data.frame(st_coordinates(ssrd_sf))
+ssrd_sf$x = coor$X
+ssrd_sf$y = coor$Y
+ssrd_nogeom = st_drop_geometry(ssrd_sf)
+ssrd_nogeom=na.omit(ssrd_nogeom)
+gs <- gstat(formula=t2m~1, locations=~x+y, data=ssrd_nogeom, nmax=Inf,set=list(idp=6)) 
+gs
+st_bbox(ssrd_sf)
+st_bbox(indonesia)
+raster_template = rast( resolution = 0.05,
+                        xmin=95.01079 , ymin=-11.00762  ,xmax=141.01940 , ymax=6.07693 ,  
+                        crs = st_crs(indonesia)$wkt)
+raster_template
+print(raster_template)
+idw <- interpolate(raster_template, gs, debug.level=0) 
+tem_mask <- mask(idw, indonesia)
+raster::writeRaster(tem_mask, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/temperature_mask.tif", overwrite = TRUE)
+names(tem_mask) = c( "Temperature","observed" )
+print(tem_mask)
+tem_mask$Temperature <- tem_mask$Temperature - 272.15
+
+print(tem_mask)
+#Visualising the interpolated results
+tmap_mode("view")
+tm_shape(tem_mask$Temperature) + 
+  tm_raster(col="Temperature", style = "quantile", n = 10, palette= "Reds", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#idp--------
+RMSE <- function(observed, t2m) {
+  sqrt(mean((t2m - observed)^2, na.rm=TRUE))
+}
+
+null <- RMSE(mean(ssrd_sf$t2m), ssrd_sf$t2m)
+null #2990478 is the baseline. 
+
+n_idp = 20 #examine power ranging from 1 to 20
+n_fold =10
+
+rmse <- rep(NA, n_fold) #generate 10 NA
+set.seed(7713)
+kf <- sample(1:n_fold, nrow(ssrd_nogeom), replace=TRUE)
+#View(kf)
+va = data.frame( c(1:n_idp), NA)
+colnames(va) =c("idp","rmse") 
+
+for (j in 1:n_idp) {
+  for (i in 1:n_fold) {
+    test <- ssrd_nogeom[kf == 1, ]
+    train <- ssrd_nogeom[kf != 1, ]
+    #Data corresponding to kf == 1 is assigned to the test set, 
+    #and data corresponding to kf != 1 is assigned to the training set.
+    gs <- gstat(formula=t2m~1, locations=~x+y, data=train, nmax=Inf, set=list(idp=j))
+    #set=list(idp=j) specifying the idp value to test
+    pre = predict(gs, test, debug.level=0 )
+    rmse[i] <- RMSE(test$t2m, pre$var1.pred)
+  }
+  va[j,2] = (mean(rmse) )
+}
+
+va[which(va$rmse==min(va)),]
+
+library(ggplot2)
+ggplot(va) +
+  geom_point(aes(x = idp, y= rmse))+
+  geom_hline(yintercept=min(va), linetype="dashed", color = "red")+
+  theme_classic()
+
+
+
+#elevation-----
+library(raster)
+ele <- raster("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/IDN_alt.gri")
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+indonesia<-st_transform(indonesia,4326)
+elevation_mask <- mask(ele, indonesia)
+na.omit(elevation_mask)
+names(elevation_mask) <- "elevation_m"
+tm_shape(elevation_mask) + 
+  tm_raster(col="elevation_m", style = "quantile", n = 10, palette= "Greens", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+#slope-----------
+slope_raster <- terrain(elevation_mask, v="slope", unit="degrees")
+names(slope_raster) <- "slope_degrees"
+tm_shape(slope_raster) + 
+  tm_raster(col="slope_degrees", style = "quantile",n=10, palette= "-viridis", legend.show = TRUE) +
+  tm_layout(legend.show = TRUE) +
+  tm_scale_bar()
+#urban area----downsample to altitude_r--------
+library(raster)
+idn<-rast("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/idn_bsgme_v0a_100m_2020.tif")
+print(idn)
+library(tmap)
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+altitude_c <- crop(idn, st_bbox(indonesia)) 
+names(altitude_c) = "alt"
+resolution <- rast(nrows=10000, ncols=25000,xmin=95.01079 , ymin=-11.00762  ,xmax=141.01940 , ymax=6.07693 ,crs = st_crs(indonesia)$wkt)
+#crs(resolution) = crs(altitude_c)
+altitude_r = resample(altitude_c,resolution )
+altitude_r
+terra::writeRaster(altitude_r, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/Urban.tif",overwrite=TRUE)
+names(altitude_r) <- "Urbanisation_level"
+tm_shape(altitude_r) + 
+  tm_raster(col="Urbanisation_level", style = "quantile", n = 2, palette= "YlOrRd", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#tm_shape(altitude_r)+ tm_raster(style= "pretty", labels= c("non_urban", "urban"), alpha=.7) 
+
+#protected area ----------------------------------------------------------
+library(sf)
+library(terra)
+library(spatstat)
+library(tmap)
+library(dplyr)
+library(rgdal)
+library(gstat)
+#install.packages("readxl")
+library(readxl)
+library(ggplot2)
+#install.packages("ggspatial")
+library(ggspatial)
+wd="~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/"
+
+prt<-st_read(paste0(wd,"WDPA_WDOECM_Apr2023_Public_IDN_shp-polygons.shx"))
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+indonesia = st_transform(indonesia, st_crs(prt))
+
+transparent_theme <- theme(
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill='transparent', colour=NA),
+  plot.background = element_rect(fill='transparent', colour=NA),
+  axis.line = element_line(colour = "black"))
+
+ggplot() +
+  geom_sf(data = indonesia, fill = "grey") +
+  geom_sf(data = prt, fill ="green") +
+  transparent_theme+
+  annotation_scale(location = "bl", bar_cols = c("black","white"), text_cex = 0.6)
+
+#peat land----------
+peat<-st_read("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/Indonesia_peat_lands.geojson")
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+indonesia = st_transform(indonesia, st_crs(peat))
+
+transparent_theme <- theme(
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill='transparent', colour=NA), 
+  plot.background = element_rect(fill='transparent', colour=NA),
+  axis.line = element_line(colour = "black"))
+
+ggplot() +
+  geom_sf(data = indonesia, fill = "grey") +
+  geom_sf(data = peat, fill ="blue") +
+  transparent_theme+
+  annotation_scale(location = "bl", bar_cols = c("black","white"), text_cex = 0.6)
+#power lines distribution-------
+library(sf)
+library(raster)
+library(ggplot2)
+library(tmap)
+#install.packages("ggspatial")
+library(ggspatial)
+grid<- st_read("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/grid.geojson")
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+# get same crs
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+indonesia = st_transform(indonesia, st_crs(grid))
+#plot
+transparent_theme <- theme(
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill='transparent', colour=NA),
+  plot.background = element_rect(fill='transparent', colour=NA),
+  axis.line = element_line(colour = "black"))
+
+
+map5<-ggplot() +
+  geom_sf(data=indonesia, fill='antiquewhite') +
+  geom_sf(data=grid, color='blue') +
+  transparent_theme + 
+  annotation_scale(location = "bl", bar_cols = c("black","white"), text_cex = 0.6)
+map5
+#road lines ---------
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+road = st_read(paste0(wd,"IDN_roads.shp" ))
+# get same crs
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+indonesia = st_transform(indonesia, st_crs(road))
+transparent_theme <- theme(
+  panel.grid.major = element_blank(), 
+  panel.grid.minor = element_blank(),
+  panel.background = element_rect(fill='transparent', colour=NA),
+  plot.background = element_rect(fill='transparent', colour=NA),
+  axis.line = element_line(colour = "black"))
+
+
+map6<-ggplot() +
+  geom_sf(data=indonesia, fill='antiquewhite') +
+  geom_sf(data=road, color='red') +
+  transparent_theme + 
+  annotation_scale(location = "bl", bar_cols = c("black","white"), text_cex = 0.6)
+map6
+#land aspect------
+library(tmap)
+cov <- raster("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/IDN_cov.gri")
+cov_table<-as.data.frame(cov)
+head(cov)c
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+indonesia = st_transform(indonesia, st_crs(cov))
+cov_mask <- mask(cov, indonesia)
+na.omit(cov_mask)
+raster::writeRaster(cov_mask, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/aspect_mask.tif", overwrite = TRUE)
+# Define breaks for the aspect classes
+breaks <- seq(0, 360, by = 18)
+names(cov_mask) <- "Aspect.class"
+# Create the map with the "fixed" style
+tm_shape(cov_mask) + 
+  tm_raster(col="Aspect.class", style = "pretty",n= 8, palette = "Purples", legend.show = TRUE) +
+  tm_layout(legend.show = TRUE) +
+  tm_scale_bar()
+
+#elevation<90-----
+library(raster)
+library(sf)
+library(tmap)
+library(dplyr)
+library(sp)
+library(terra)
+elevation_mask
+print(elevation_mask)
+class(elevation_mask_m)
+elevation_mask_spatial<- as(elevation_mask, "SpatRaster")
+#terra::writeRaster(elevation_mask_spatial, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/elevation.tif",overwrite=TRUE)
+elevation_mask_m<-matrix(c(-19, 90,  1,
+                           90, 4650, 0), ncol=3, byrow=TRUE) 
+elevation_class <- classify(elevation, elevation_mask_m, include.lowest=TRUE )
+names(elevation_class) <- "Elevation Index"
+tm_shape(elevation_class) + 
+  tm_raster(col="Elevation Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#slope<9----
+slope_raster <- terrain(elevation_mask, "slope")
+names(slope_raster) <- "slope_degrees"
+slope_spatial<- as(slope_raster, "SpatRaster")
+terra::writeRaster(slope_rc_spatial, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/slope_class.tif",overwrite=TRUE)
+print(slope_spatial)
+slope_m<-matrix(c(0, 0.9,  1,
+                  0.9, Inf, 0), ncol=3, byrow=TRUE) 
+slope_rc_spatial <- classify(slope_spatial, slope_m, include.lowest=TRUE )
+names(slope_rc_spatial) <- "Slope Index"
+tm_shape(slope_rc_spatial) + 
+  tm_raster(col="Slope Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#urban proximity>1500 with urbanisation level>0.75----
+library(rgeos)
+library(raster)
+library(sp)
+library(terra)
+library(sf)
+library(spatstat)
+library(tmap)
+library(dplyr)
+library(rgdal)
+library(gstat)
+urban<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/Urban.tif"))
+print(urban)
+urban[urban==0] <- NA
+resolution <- rast(resolution = 0.05, 
+                   xmin = 95.01079, xmax = 141.0194, ymin = -11.00762, ymax = 6.07693)
+urban_t <- resample(urban, resolution)
+# Calculate the distance to the nearest non-NA pixel
+urban_distance <- distance(urban_t)
+indonesia = st_read(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/idn_admbnda_adm0_bps_20200401.shp" ))
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+urban_distance <- mask(urban_distance, indonesia)
+raster::writeRaster(urban_distance, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/Urban_distance.tif", overwrite = TRUE)
+urban_m<-matrix(c(1500, 50000,  1,
+                  0, 1500, 0,
+                  50000,Inf,0), ncol=3, byrow=TRUE) 
+urban_distance_1500 <- classify(urban_distance, urban_m, include.lowest=TRUE )
+names(urban_distance_1500) <- "Urban Index"
+tm_shape(urban_distance_1500) + 
+  tm_raster(col="Urban Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+
+#
+#road proximity 50 m – 25,000 m sample essay= 1.0 ---------
+indonesia = st_read(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/idn_admbnda_adm0_bps_20200401.shp" ))
+roads = st_read(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/IDN_roads.shp" ))
+roads_geometry <- st_geometry(roads)
+bbox <- st_bbox(indonesia)
+roads_sp <- as(roads_geometry, "Spatial")
+r <- raster(extent(bbox), res = 0.0311, crs = 4326)
+roads_rasterized <- rasterize(roads_sp, r, field = 1, fun = "count")
+road_raster <- roads_rasterized
+road_raster[road_raster >= 2 & road_raster <= 100] <- 1
+road_raster[road_raster != 1] <- 0
+road_raster[road_raster <= 0] <- NA
+raster::writeRaster(road_raster, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/ROAD_CHECK.tif", overwrite = TRUE)
+road_rast <- rast(road_raster)
+dist=distance(road_rast)
+raster::writeRaster(dist, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/road_distance.tif", overwrite = TRUE)
+road_dist=rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/road_distance.tif"))
+road_m<-matrix(c(0, 150, 0,
+                 150, 25000, 1,
+                 25000,50000, 0.5,
+                 50000,1002322 ,0), ncol=3, byrow=TRUE) 
+road_distance <- classify(road_dist, road_m)
+barplot(road_distance)
+terra::writeRaster(road_distance, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/road_class.tif",overwrite=TRUE)
+
+plot(road_distance)
+#road_distance[road_distance == 0] <- NA
+plot(road_distance)
+names(road_distance) <- "Road Proximity Index"
+tm_shape(road_distance) + 
+  tm_raster(col="Road Proximity Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+
+
+#grid proximity <50000;100000,150000---------
+# Grid data
+library(ggspatial)
+grid<- st_read("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/grid.geojson")
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+# Transform coordinates to GWS 84
+grid_GWS84 <- st_transform(grid, crs = 4326)
+grid_GWS84 <- st_geometry(grid_GWS84)
+bbox <- st_bbox(indonesia)
+grid_sp <- as(grid_GWS84, "Spatial")
+# Create an empty raster with the desired extent, resolution, and CRS
+r <- raster(extent(bbox), res = 0.022, crs = 4326) # if 1 degree is 111.1 km, 0.022 is 2.45 km, approx 6 km2
+# Rasterize the lines using a simple "burn" approach
+rasterized <- rasterize(grid_sp, r, field = 1, fun = "count")
+grid_raster <- rasterized
+grid_raster[grid_raster >= 2 & grid_raster <= 100] <- 1
+grid_raster[grid_raster != 1] <- 0
+grid_raster[grid_raster <= 0] <- NA
+grid_rast <- rast(grid_raster)
+# Calculate the distance to the nearest non-NA pixel
+grid_distance <- distance(grid_rast) # TAKES A LONG TIME TO RUN
+grid_distance <- mask(grid_distance, indonesia)
+raster::writeRaster(grid_distance, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/GRID_DISTANCE.tif", overwrite = TRUE)
+
+grid_m<-matrix(c(0, 50000, 1,
+                 50000, 100000, 0.6,
+                 100000,150000, 0.3,
+                 150000,662609.2 ,0), ncol=3, byrow=TRUE) 
+grid_dist <- classify(grid_distance, grid_m)
+barplot(grid_dist)
+#grid_dist[grid_dist == 0] <- NA
+plot(grid_dist)
+names(grid_dist) <- "Grid Proximity Index"
+tm_shape(grid_dist) + 
+  tm_raster(col="Grid Proximity Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#protected area-----
+prt<-st_read(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/WDPA_WDOECM_Apr2023_Public_IDN_shp-polygons.shx"))
+indonesia = st_read(paste0(wd,"idn_admbnda_adm0_bps_20200401.shp" ))
+# Transform coordinates to GWS 84
+prt_GWS84 <- st_transform(prt, crs = 4326)
+prt_GWS84 <- st_geometry(prt_GWS84)
+bbox <- st_bbox(indonesia)
+prt_sp <- as(prt_GWS84, "Spatial")
+# Create an empty raster with the desired extent, resolution, and CRS
+r <- raster(extent(bbox), res = 0.022, crs = 4326) # if 1 degree is 111.1 km, 0.022 is 2.45 km, approx 6 km2
+# Rasterize the lines using a simple "burn" approach
+rasterized <- rasterize(prt_sp, r, field = 1, fun = "count")
+prt_raster <- rasterized
+prt_raster[prt_raster >= 2 & prt_raster <= 100] <- 1
+prt_raster[prt_raster != 1] <- 0
+prt_raster[prt_raster <= 0] <- NA
+prt_rast <- rast(prt_raster)
+# Calculate the distance to the nearest non-NA pixel
+prt_distance <- distance(prt_rast) # TAKES A LONG TIME TO RUN
+prt_distance <- mask(prt_distance, indonesia)
+raster::writeRaster(prt_distance, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/prt_DISTANCE.tif", overwrite = TRUE)
+
+prt_m<-matrix(c(0, 1500, 0,
+                1500, 508888.4 , 1), ncol=3, byrow=TRUE) 
+prt_dist <- classify(prt_distance, prt_m)
+barplot(prt_dist)
+#prt_dist[prt_dist == 0] <- NA
+plot(prt_dist)
+names(prt_dist) <- "Distance to Protected areas"
+tm_shape(prt_dist) + 
+  tm_raster(col="Distance to Protected areas", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#peatland------
+peat<-st_read("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/Indonesia_peat_lands.geojson")
+peat_geometry <- st_geometry(peat)
+bbox <- st_bbox(indonesia)
+peat_sp <- as(peat_geometry, "Spatial")
+r <- raster(extent(bbox), res = 0.0311, crs = 4326)
+roads_rasterized <- rasterize(peat_sp, r, field = 1, fun = "count")
+road_raster <- roads_rasterized
+road_raster[road_raster >= 2 & road_raster <= 100] <- 1
+road_raster[road_raster != 1] <- 0
+road_raster[road_raster <= 0] <- NA
+raster::writeRaster(road_raster, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/ROAD_CHECK.tif", overwrite = TRUE)
+road_rast <- rast(road_raster)
+
+
+#energy output >15,000,000=1; 10,000,000~15,000,000=2-------
+power<-rast("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/power_mask.tif")
+power_m<-matrix(c(1600000, 1626021.4 ,  1,
+                  1000000, 1600000, 0.5,
+                  0,1000000, 0), ncol=3, byrow=TRUE) 
+power_rc_spatial <- classify(power, power_m, include.lowest=TRUE )
+barplot(power_rc_spatial)
+#power_rc_spatial[power_rc_spatial == 0] <- NA
+plot(power_rc_spatial)
+names(power_rc_spatial) <- "Power Index"
+tm_shape(power_rc_spatial) + 
+  tm_raster(col="Power Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#temperature 17-27-------
+tem<-rast("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/temperature_mask.tif")
+tem=tem$Temperature
+raster::writeRaster(tem, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/temp_mask.tif", overwrite = TRUE)
+tem_m<-matrix(c(0, 17 , 0,
+                17, 27, 1,
+                27,Inf, 0), ncol=3, byrow=TRUE) 
+tem_rc_spatial <- classify(tem, tem_m, include.lowest=TRUE )
+barplot(tem_rc_spatial)
+
+#tem_rc_spatial[tem_rc_spatial == 0] <- NA
+plot(tem_rc_spatial)
+names(tem_class) <- "Temperature Index"
+tm_shape(tem_class) + 
+  tm_raster(col="Temperature Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#aspect facing north or south- INDEX 3-8 AND 14-17-------
+aspect<-rast("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/aspect_mask.tif")
+asp_m<-matrix(c(0, 3 , 0,
+                3, 8, 1,
+                8,14, 0,
+                14,17,1,
+                17,22,0), ncol=3, byrow=TRUE) 
+asp_spatial <- classify(aspect, asp_m, include.lowest=TRUE )
+barplot(asp_spatial)
+#tem_rc_spatial[tem_rc_spatial == 0] <- NA
+plot(tem_rc_spatial)
+names(aspect_class) <- "Aspect Index"
+tm_shape(aspect_class) + 
+  tm_raster(col="Aspect Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+#install.packages("ahpsurvey")
+#peatland convert-------
+peatland<- st_read(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/peatland_shape.shp" ))
+peat_geometry <- st_geometry(peatland)
+bbox <- st_bbox(indonesia)
+peat_geometry_no_z <- st_zm(peat_geometry, drop_z = TRUE, drop_m = TRUE)
+peat_sp <- as(peat_geometry_no_z, "Spatial")
+r <- raster(extent(bbox), res = 0.0311, crs = 4326)
+peat_rasterized <- rasterize(peat_sp, r, field = 1, fun = "count")
+peat_raster <- peat_rasterized
+peat_raster[peat_raster >= 2 & peat_raster <= 100] <- 1
+peat_raster[peat_raster != 1] <- 0
+peat_raster[peat_raster <= 0] <- NA
+tm_shape(peat_mask) + 
+  tm_raster(col="layer", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+indonesia = st_read(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/idn_admbnda_adm0_bps_20200401.shp" ))
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+indonesia = st_transform(indonesia, st_crs(peat))
+peat_mask<-mask(peat_raster,indonesia)
+raster::writeRaster(peat_mask, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/peatland.tif", overwrite = TRUE)
+#------------------
+library(raster)
+library(rgdal)
+library(ahpsurvey)
+wd=setwd("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/")
+aspect<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/aspect_mask.tif"))
+tem<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/temp_mask.tif"))
+power<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/power_mask.tif"))
+prt_distance<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/prt_DISTANCE.tif"))
+grid_distance<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/GRID_DISTANCE.tif"))
+road_distance<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/road_distance.tif"))
+urban_distance<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/Urban_distance.tif"))
+slope<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/slope.tif"))
+elevation<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/elevation.tif"))
+asp_m<-matrix(c(0, 3 , 0,
+                3, 8, 1,
+                8,14, 0,
+                14,17,1,
+                17,22,0), ncol=3, byrow=TRUE) 
+aspect_class <- classify(aspect, asp_m, include.lowest=TRUE )
+barplot(aspect_class)
+terra::writeRaster(aspect_class, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/aspect_class.tif",overwrite=TRUE)
+tem_m<-matrix(c(0, 17 , 0,
+                17, 27, 1,
+                27,Inf, 0), ncol=3, byrow=TRUE) 
+tem_class <- classify(tem, tem_m, include.lowest=TRUE )
+barplot(tem_class)
+terra::writeRaster(tem_class, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/tem_class.tif",overwrite=TRUE)
+
+power_m<-matrix(c(1600000, Inf ,  1,
+                  1000000, 1600000,0.5,
+                  0,1000000, 0), ncol=3, byrow=TRUE) 
+power_class <- classify(power, power_m, include.lowest=TRUE )
+barplot(power_class)
+terra::writeRaster(power_class, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/power_class.tif",overwrite=TRUE)
+prt_m<-matrix(c(0, 1500, 0,
+                1500, Inf , 1), ncol=3, byrow=TRUE) 
+prt_dist_class <- classify(prt_distance, prt_m)
+barplot(prt_dist_class)
+terra::writeRaster(prt_dist_class, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/prt_class.tif",overwrite=TRUE)
+
+grid_m<-matrix(c(0, 50000, 1,
+                 50000, 100000, 0.6,
+                 100000,150000, 0.3,
+                 150000,662609.2 ,0), ncol=3, byrow=TRUE) 
+grid_dist_class <- classify(grid_distance, grid_m)
+terra::writeRaster(grid_distance, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/grid_class.tif",overwrite=TRUE)
+barplot(grid_dist_class)
+road_m<-matrix(c(0, 150, 0,
+                 150, 25000, 1,
+                 25000,50000, 0.5,
+                 50000,1002322 ,0), ncol=3, byrow=TRUE) 
+road_distance_class <- classify(road_dist, road_m)
+urban_m<-matrix(c(1500, 50000,  1,
+                  0, 1500, 0,
+                  50000,Inf,0), ncol=3, byrow=TRUE) 
+urban_distance_class <- classify(urban_distance, urban_m, include.lowest=TRUE )
+plot(urban_distance_class)
+terra::writeRaster(urban_distance_class, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/urban_class.tif",overwrite=TRUE)
+
+slope_m<-matrix(c(0, 0.09,  1,
+                  0.09, 0.7926961, 0), ncol=3, byrow=TRUE) 
+slope_class <- classify(slope, slope_m, include.lowest=TRUE )
+terra::writeRaster(slope_class, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/slope_class.tif",overwrite=TRUE)
+
+elevation_mask_m<-matrix(c(-19, 90,  1,
+                           90, 4650, 0), ncol=3, byrow=TRUE) 
+elevation_class <- classify(elevation, elevation_mask_m, include.lowest=TRUE )
+terra::writeRaster(elevation_class, "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP/elevation_class.tif",overwrite=TRUE)
+
+peatland_class<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/peatland.tif"))
+peat_mask<-mask(peatland_class,indonesia)
+read.csv("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/ahp.csv")
+# AHP--------
+library(raster)
+library(rgdal)
+library(ahpsurvey)
+# Normalize raster layers (scale values between 0 and 1)
+# Custom rescale function
+
+rescale_raster <- function(raster, min_val = 0, max_val = 1) {
+  raster_min <- min(values(raster), na.rm = TRUE)
+  raster_max <- max(values(raster), na.rm = TRUE)
+  return ((raster - raster_min) / (raster_max - raster_min)) * (max_val - min_val) + min_val
+}
+
+# Rescale raster layer
+elevation_norm <- rescale_raster(elevation_class, min_val = 0, max_val = 1)
+peatland_norm <- rescale_raster(peatland_class, min_val = 0, max_val = 1)
+slope_norm <- rescale_raster(slope_class, min_val = 0, max_val = 1)
+urban_norm <- rescale_raster(urban_distance_class, min_val = 0, max_val = 1)
+road_norm <- rescale_raster(road_distance_class, min_val = 0, max_val = 1)
+grid_norm <- rescale_raster(grid_dist_class, min_val = 0, max_val = 1)
+prt_norm <- rescale_raster(prt_dist_class, min_val = 0, max_val = 1)
+power_norm <- rescale_raster(power_class, min_val = 0, max_val = 1)
+tem_norm <- rescale_raster(tem_class, min_val = 0, max_val = 1)
+aspect_norm <- rescale_raster(aspect_class, min_val = 0, max_val = 1)
+result<-elevation_norm*0.8+peatland_norm*0.2
+#criteria
+AHP_layers <- list(
+  elevation_class,
+  peatland_class,
+  slope_class,
+  urban_distance_class,
+  road_distance_class,
+  grid_dist_class,
+  prt_dist_class,
+  power_class,
+  tem_class,
+  aspect_class)
+
+output_folder <- "~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/AHP"
+
+for (layer_name in names(AHP_layers)) {
+  output_filepath <- file.path(output_folder, paste0(layer_name, "_normalized.tif"))
+  writeRaster(AHP_layers[[layer_name]], output_filepath, overwrite=TRUE)
+}
+
+#QGIS USED FOR AHP
+
+# Set the new extent
+extent(raster_layer) <- extent(xmin_value, xmax_value, ymin_value, ymax_value)
+return(raster_layer)
+
+# Define weights for each layer
+weights <- c(elevation = 0.079, peatland = 0.116, slope = 0.091,urban = 0.048, road = 0.064, grid = 0.118,prt = 0.116, power = 0.312, tem = 0.021,aspect=0.035)
+lapply(AHP_layers, projection)
+# Set the PROJ.4 string for WGS84
+proj4string_wgs84 <- "+proj=longlat +datum=WGS84 +no_defs"
+# Update the CRS for all raster layers in the list using a loop
+for (layer_name in names(AHP_layers)) {
+  crs(AHP_layers[[layer_name]]) <- proj4string_wgs84
+}
+# set the same extents
+reference_raster <- AHP_layers[["elevation"]]
+AHP_layers_projected <- lapply(AHP_layers, function(raster_layer) {
+  projectRaster(raster_layer, crs = projection(reference_raster), res = res(reference_raster), 
+                extent = extent(reference_raster), method = "bilinear")
+})
+# Apply weights to the layers and combine the result
+weighted_result <- AHP_layers[["elevation"]] * weights["elevation"] + AHP_layers[["peatland"]] * weights["peatland"] + AHP_layers[["slope"]] * weights["slope"]+AHP_layers[["urban"]] * weights["urban"] + AHP_layers[["road"]] * weights["road"] + AHP_layers[["grid"]] * weights["grid"]+AHP_layers[["prt"]] * weights["prt"] + AHP_layers[["power"]] * weights["power"] + AHP_layers[["tem"]] * weights["tem"]+AHP_layers[["aspect"]] * weights["aspect"] 
+library(sp)
+library(raster)
+library(terra)
+library(sf)
+library(tmap)
+lsi<-rast("~/Desktop/AHP_BEFORE_CLASS.tif")
+class(lsi)
+q <- quantile(lsi, probs = seq(0, 1, by = 0.25), na.rm = TRUE)
+q
+lsi
+plot(lsi)
+indonesia<-st_read("country.shp")
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+lsi_crop <- mask(lsi,indonesia ) 
+names(lsi_crop) = "LSI"
+#resolution <- rast(nrows=10000, ncols=25000,xmin=95.01079 , ymin=-11.00762  ,xmax=141.01940 , ymax=6.07693 ,crs = st_crs(indonesia)$wkt)
+#crs(resolution) = crs(altitude_c)
+#altitude_r = resample(altitude_c,resolution )
+#altitude_r
+names(lsi_crop) <- "LSI"
+print(lsi_crop)
+lsi_m<-matrix(c(-Inf, 2305, 1,
+                2305, 4341, 2,
+                4341,6818, 3,
+                6818,15350 ,4,
+                15350,67707, 5), ncol=3, byrow=TRUE) 
+lsi_reclassify <- classify(lsi_crop, lsi_m)
+
+print(lsi_reclassify)
+indonesia <- st_set_crs(indonesia, "EPSG:4326")
+indonesia = st_transform(indonesia, st_crs(grid))
+lsi_reclassify<-mask(indonesia,lsi_reclassify)
+#raster::writeRaster(lsi_reclassify, "~/Desktop/lsi_reclassify.tif", overwrite = TRUE)
+names(lsi_reclassify) <- "Land Suitability Index"
+tmap_mode("plot")
+tm_shape(lsi_reclassify) + 
+  tm_raster(col="Land Suitability Index", style = "cat", palette= "-viridis", legend.show = TRUE)+
+  tm_layout(legend.show = TRUE)+
+  tm_scale_bar()
+
+# 8 power plants needed calculated
+# solar powerplants cite selection based on distance to power transmission lines------
+# Load necessary libraries
+library(raster)
+library(rgdal)
+
+# Read raster data
+land_suitability_raster <- lsi_reclassify
+grid_transmission_raster<-rast(paste0("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data2/GRID_DISTANCE.tif"))
+
+# Calculate distance to grid transmission lines
+distance_to_grid <- distance(grid_transmission_raster)
+crs(distance_to_grid)
+crs(land_suitability_raster)
+# Combine land suitability and distance to grid transmission lines
+combined_raster <- mask(land_suitability_raster, distance_to_grid)
+plot(combined_raster)
+
+# Find the 8 nearest locations to the grid transmission lines
+n_locations <- 8
+nearest_locations <- which.min(combined_raster)
+
+for (i in 2:n_locations) {
+  # Exclude the current nearest location from the search by setting its value to a large number
+  combined_raster[nearest_locations[[i - 1]]] <- Inf
+  
+  # Find the next nearest location
+  nearest_locations[[i]] <- which.min(combined_raster)
+}
+
+# Get coordinates of the nearest locations
+nearest_coordinates <- xyFromCell(combined_raster, nearest_locations)
+
+# Create a SpatialPoints object for the nearest locations
+nearest_locations_sp <- SpatialPoints(nearest_coordinates, proj4string = CRS(proj4string(combined_raster)))
+
+
+
+# QGIS USED FOR AHP
+# Finicial analysis------
+# Final Graph about existing power plant , including the connection to transmission line
+merged_layer <- lsi_reclassify
+print(merged_layer)
+crs(merged_layer)
+grid<- st_read("~/Downloads/ESDA_/SPATIAL/2nd_Assignment-20230414/Data/grid.geojson")
+# Load necessary libraries
+library(raster)
+library(sf)
+# Print the SpatVector object
+grid = st_transform(grid, st_crs(merged_layer))
+dist <- terra::distance(merged_layer, grid)
+dist_new <- mask(dist, merged_layer)
+plot(dist_new)
+print(dist_new)
+
+raster::writeRaster(dist_new, "~/Desktop/Spatial Assignment 2/Indonesia Spatial Data/dist_new.tif", overwrite = TRUE)
+
+tm_shape(dist_new) + 
+  tm_raster(col="raster_suit", style = "pretty", palette = "YlOrBr", legend.show = TRUE) +
+  tm_scale_bar(text.size = 0.6, 
+               position = c("left", "bottom")) + 
+  tm_shape(Indonesia) +
+  tm_borders(col = "black", lwd = 0.5) +
+  #Add north arrow
+  tm_compass(type = "arrow", size = 3, position = c("right", "top"))+
+  tm_legend(outside = T, legend.show = T)+
+  tm_layout(main.title = "Solar Power", 
+            main.title.fontface = "bold.italic",
+            frame = F) +
+  tm_shape(power) +
+  tm_lines(col = "pink")
+
+#Estimate the each solar power plant's capacity
+radiation_to_power <- function (G, A, r=0.175, p=0.6, hours=1) { kWh <- G * A * r * p * (hours/3600) / 1000
+return(kWh)
+}
+
+G=18334131.5 # Average solar radiation
+A=10000000 # Area of one solar plant in m^2 (10 km^2)
+power_kWh <- radiation_to_power(G, A)
+power_kWh
+
+energy_demand_MW <- 32277.87  # Total energy demand in MW
+hours_per_day <- 12      # Number of solar radiation hours in a day
+days_per_year <- 365     # Number of days in a year
+
+# Calculate daily energy generation by one solar plant in kWh
+daily_energy_generation_kWh <- radiation_to_power(G, A, hours=hours_per_day)
+
+# Calculate annual energy generation by one solar plant in kWh
+annual_energy_generation_kWh <- daily_energy_generation_kWh * days_per_year
+
+# Convert energy demand to annual energy demand in kWh
+annual_energy_demand_kWh <- energy_demand_MW * 1000 * hours_per_day * days_per_year
+
+# Calculate the number of solar plants needed
+num_solar_plants <- annual_energy_demand_kWh / annual_energy_generation_kWh
+
+# Print the result
+cat("Number of solar plants needed:", ceiling(num_solar_plants))
+
+##Capital Expenditure
+
+#CapEx capacity installation = 1.16M USD/MW installed power
+#CapEx Network connection inland = 590 USD/MW.km
+#CapEx Network connection underwater = 1700 USD/MW.km
+
+#Assumptions
+installed_capacity <- 32277.87 #MW
+installation_cost <- 1160000 #$/MW
+distance_nearest_grid <- 130
+network_cost <- 590
+electricity_price <- 103 #USD/MWh
+
+
+daily_solar_energy_generation_MWh <- energy_demand_MW * hours_per_day
+yearly_solar_energy_generation_MWh <- daily_solar_energy_generation_MWh * days_per_year
+yearly_solar_energy_generation_MWh #141377071
+
+#Apply formula
+CapEx_solar = installed_capacity *installation_cost + distance_nearest_grid * network_cost
+CapEx_solar #37442405900
+Yearly_revenue <- yearly_solar_energy_generation_MWh* electricity_price
+Yearly_revenue #14561838272
+
+
+
+#NPV
+#Revenue NPV Estimated by student based on projected output from chosen sites and sold at 103
+#USD/MWh (0.103 USD/kWh ~ 0.08 GBP/kWh)
+#Discount rate NPV 5%
+#Life span NPV 25
+
+calc_NPV <- function(annual_revenue, i=0.08, lifetime_yrs, CAPEX, OPEX=0){ costs_op <- rep(OPEX, lifetime_yrs) #operating cost
+revenue <- rep(annual_revenue, lifetime_yrs)
+t <- seq(1, lifetime_yrs, 1) #output: 1, 2, 3, ...25
+NPV <- sum( (revenue - costs_op)/(1 + i)**t ) - CAPEX
+return(round(NPV, 0)) }
+
+npv <-calc_NPV (annual_revenue = 14561838272, lifetime_yrs = 25, CAPEX = 37442405900)
+
+ifelse (npv>0, "Support", "object") #"Support"
+
+
+#LCOE
+#Discount rate LCOE 8%
+Life_span_generation_kWH <- function (yearly_generation_kWH, discount = 0.08, lifetime_yrs = 25){ t<- seq(1, lifetime_yrs, 1)
+L_S_G <- sum(yearly_generation_kWH/(1+discount)**t)
+return (round(L_S_G,0))
+}
+
+LCOE <- function(NPV,Life_span_generation){ lcoe <- NPV/Life_span_generation 
+return(round(lcoe,2))
+}
+
+annual = 141377071 #kwh
+lsg <- Life_span_generation_kWH(yearly_generation_kWH = annual)
+lsg #1509168591
+
+lcoe = LCOE(NPV=npv, lsg)
+lcoe #78.19
+
+
+
+
