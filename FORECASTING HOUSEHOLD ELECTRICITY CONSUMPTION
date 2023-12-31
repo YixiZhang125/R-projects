@@ -1,0 +1,581 @@
+##data cleaning and PCA
+
+require(purrr)
+require(tidyverse)
+require(lubridate)
+require(dplyr)
+require(fastDummies)
+library(tibble)
+library(matrixStats)
+library(stats)
+library(psych)
+
+# read in data ------------------------------------------------------------
+file_names <- dir("data/archive/halfhourly_dataset/halfhourly_dataset", full.names = TRUE)
+
+# Df wide
+df_wide <- do.call(rbind, lapply(file_names, read.csv)) %>% 
+  mutate(tstp = ymd_hms(tstp)) %>% 
+  arrange(tstp, ascending = TRUE) %>% # this fix weird final columns in df_wide
+  pivot_wider(values_from = energy.kWh.hh., names_from = tstp)
+
+# Selecting the best 100 ids
+df_100 <- df_wide %>% 
+  mutate(per_NA = rowSums(is.na(.)) / ncol(.), .after = LCLid) %>% # adds columns with percent of NA for each row
+  arrange(per_NA) %>%  # Arranges from lowest NA percent to highest
+  head(100) # Select 100 households with lowest NA percent
+
+id_100 <- unique(df_100$LCLid)
+
+# Convert into long format
+df_long <- df_100 %>% 
+  pivot_longer(cols = -c('LCLid','per_NA'), values_to = 'energy_kWh', names_to = 'time') %>%
+  mutate(time = ymd_hms(time)) %>% 
+  select(LCLid, time, energy_kWh)
+#filter(time >= as.Date("2012-01-01 00:30:00") & time <= as.Date("2014-02-28 00:00:00"))
+
+# read and clean data for weather -----------------------------------------
+
+df_weather <- read.csv("data/weather_hourly_darksky.csv") %>%
+  mutate(lubridate::ymd_hms(time), .before = visibility, .keep = 'unused') %>%
+  rename(date = `lubridate::ymd_hms(time)`) %>%
+  select(-summary)
+df_weather_dummy <- dummy_cols(df_weather, select_columns=c('precipType', 'icon'),   remove_selected_columns = TRUE)
+
+# Extracting only clean id_246
+id_246 <- df_long %>%
+  filter(LCLid == "MAC000246" & energy_kWh != "Null") %>%
+  drop_na(energy_kWh) %>% 
+  rename(date = time) %>%
+  mutate(month = lubridate::month(date),
+         week = lubridate::week(date),
+         wday = lubridate::wday(date),
+         yday= lubridate::yday(date),
+  )
+sum(is.na(id_246$energy_kWh))
+
+# Turn time data cyclical -------------------------------------------------
+time <- id_246$date
+
+# Create dictionary, convert each half hour to the corresponding half hour of the day
+halfhour_num_list <- c("0 0" = "0",
+                       "0 30" = "1",
+                       "1 0" = "2",
+                       "1 30" = "3",
+                       "2 0" = "4",
+                       "2 30" = "5",
+                       "3 0" = "6",
+                       "3 30" = "7",
+                       "4 0" = "8",
+                       "4 30" = "9",
+                       "5 0" = "10",
+                       "5 30" = "11",
+                       "6 0" = "12",
+                       "6 30" = "13",
+                       "7 0" = "14",
+                       "7 30" = "15",
+                       "8 0" = "16",
+                       "8 30" = "17",
+                       "9 0" = "18",
+                       "9 30" = "19",
+                       "10 0" = "20",
+                       "10 30" = "21",
+                       "11 0" = "22",
+                       "11 30" = "23",
+                       "12 0" = "24",
+                       "12 30" = "25",
+                       "13 0" = "26",
+                       "13 30" = "27",
+                       "14 0" = "28",
+                       "14 30" = "29",
+                       "15 0" = "30",
+                       "15 30" = "31",
+                       "16 0" = "32",
+                       "16 30" = "33",
+                       "17 0" = "34",
+                       "17 30" = "35",
+                       "18 0" = "36",
+                       "18 30" = "37",
+                       "19 0" = "38",
+                       "19 30" = "39",
+                       "20 0" = "40",
+                       "20 30" = "41",
+                       "21 0" = "42",
+                       "21 30" = "43",
+                       "22 0" = "44",
+                       "22 30" = "45",
+                       "23 0" = "46",
+                       "23 30" = "47")
+
+
+halfhour_num <- c()
+
+for (i in 1:length(time)) {
+  halfhour_num[i] <- halfhour_num_list[paste(lubridate::hour(id_246$date[i]),
+                                             lubridate::minute(id_246$date[i]))]
+}
+
+id_246_hh <- cbind(id_246, halfhour = as.integer(halfhour_num))
+
+# Merge weather and consumption data together -----------------------------
+
+# weather is hour, so look at hour data
+id_246_h <- id_246_hh %>%
+  subset(lubridate::minute(date) == "0") %>%
+  mutate(hour = lubridate::hour(date))
+
+# function for turning hour data cyclical
+# We know the lag is 24, from the ACF plot
+prep_df_h <- function(df){
+  df %>%
+    transmute(LCLid = LCLid,
+              date = date,
+              energy_kWh = energy_kWh, # Lag is incorporated in the code for RNN
+              sinh = sin(2 * pi * hour / 24),
+              cosh = cos(2 * pi * hour / 24),
+              sinmonth = sin(2 * pi * month / 12),
+              cosmonth = cos(2 * pi * month / 12),
+              sinwday = sin(2 * pi * wday / 7),
+              coswday = cos(2 * pi * wday / 7),
+              sinweek = sin(2 * pi * week / 52),
+              cosweek = cos(2 * pi * week / 52),
+              sinyday = sin(2* pi * yday / 365),
+              cosyday = cos(2* pi * yday / 365)) %>%
+    na.omit()
+}
+
+df_model_merge <- prep_df_h(id_246_h) %>%
+  left_join(df_weather_dummy, by=c("date")) %>%
+  na.omit()
+
+# To write a file with info
+write.csv(df_model_merge, "data/df_merge.csv", row.names = FALSE)
+
+
+#___________________________________________________________________
+#PCA
+df <- df_model_merge %>%
+  mutate(date = ymd_hms(date),
+         energy_kWh = as.numeric(energy_kWh)) %>%
+  select(-'LCLid',-'precipType_rain',-'precipType_snow',-'icon_clear-day',
+         -'icon_clear-night',-'icon_cloudy',-'icon_fog',-'icon_partly-cloudy-day', 
+         -'icon_partly-cloudy-night',-'icon_wind')
+
+# plotting all the time series
+ggplot(df, aes(x = date,
+               y = energy_kWh)) + 
+  geom_line(size = .1)
+
+#Normalization of data previous to PCA
+#______________________________________________________________________________
+# Convert the data frame to a matrix and remove the first column (target variable)
+data <- data.matrix(df[,-1])
+# Calculate the mean and standard deviation of the columns
+mean <- colMeans(data)
+std <- colSds(data)
+# Scale the columns using the mean and standard deviation
+data <- scale(data, center = mean, scale = std)
+# Define a function that normalizes a vector
+normalize <- function(x){
+  return(( x - min(x)) / (max(x) - min(x)))
+}
+max <- colMaxs(data)
+min <- colMins(data)
+# Normalize the columns using the normalize() function
+data <- apply(data, 2, normalize)
+
+#______________________________________________________________________________
+#Principal Component Analysis with function princomp()
+pca <- princomp(data[, -1], cor = TRUE) # Excluding the target variable
+# Print the results
+print(pca)
+summary(pca)
+#scree plot
+screeplot(pca, type = "barplot", main = "Scree plot", npcs = 16)
+#For the scree plot
+ev <- pca$sdev^2
+ev
+# According to the scree plot the elbow point is achieved at the principal component 5.
+# According to the Kaiser criterion, only the six first components possess enough variance to make them worth using.
+# To achieve 80% (commonly accepted as a good value) of explained variance will use 7 principal components. Important to note the 7th value
+# of variance is almost 1, so very close to the kaiser creterion
+
+#So, let's use 7 Principal Components. 
+#RECASTING THE DATA TO THE NEW AXES
+
+selected_pc <- data.frame(pca$loadings[, 1:7])
+data_transform <- predict(pca, data[, -1])
+
+#create a new data frame with electricity and the 10 principal components
+
+row_nums <- seq_len(nrow(data))
+df_pca <- data.frame(
+  dates = df[, 1],
+  energy = data[, 1],
+  pc = data_transform[, 1:7],
+  row_num = row_nums) %>% 
+  select(-'row_num')
+
+##RNN
+
+library(tibble)
+library(readr)
+library(dplyr)
+library(tidyverse)
+library(lubridate)
+library(ggplot2)
+library(keras)
+library(tensorflow)
+
+train_data_pc <- read_csv("data/train_data_pc.csv")
+val_data_pc <- read_csv("data/val_data_pc.csv")
+test_data_pc <- read_csv("data/test_data_pc.csv")
+glimpse(train_data_pc)
+
+
+##Plot to have a rough understanding of the data
+
+
+library(ggplot2)
+q <- ggplot(train_data_pc, aes(x = 1:nrow(train_data_pc), y = `target`)) + geom_line()
+q
+r <- ggplot(train_data_pc[1:500,], aes(x = 1:500, y = `target`)) + geom_line()
+r
+
+##preprocessed 7 PCAs
+names <- c('target','V8','V1','V2','V3','V4','V5','V6','V7')
+
+names(train_data_pc) <- names
+names(val_data_pc) <- names
+names(test_data_pc) <- names
+
+data <- rbind(train_data_pc,val_data_pc,test_data_pc)
+
+data <- as.matrix(data)
+train_data_pc <- as.matrix(train_data_pc)
+val_data_pc <- as.matrix(val_data_pc)
+test_data_pc <- as.matrix(test_data_pc)
+
+##RNN model
+generator <- function(data, lookback, delay, min_index, max_index,
+                      shuffle = FALSE, batch_size = 100, step = 24) {
+  if (is.null(max_index))
+    max_index <- nrow(data) - delay - 1
+  i <- min_index + lookback
+  function() {
+    if (shuffle) {
+      rows <- sample(c((min_index+lookback):max_index), size = batch_size)
+    } else {
+      if (i + batch_size >= max_index)
+        i <<- min_index + lookback
+      rows <- c(i:min(i+batch_size-1, max_index))
+      i <<- i + length(rows)
+    }
+    
+    samples <- array(0, dim = c(length(rows),
+                                lookback / step,
+                                dim(data)[[-1]]))
+    targets <- array(0, dim = c(length(rows)))
+    
+    for (j in 1:length(rows)) {
+      indices <- seq(rows[[j]] - lookback, rows[[j]]-1,
+                     length.out = dim(samples)[[2]])
+      samples[j,,] <- data[indices,]
+      targets[[j]] <- data[rows[[j]] + delay,1]
+    }           
+    list(samples, targets)
+  }
+}
+
+lookback <- 2
+step <- 1
+delay <- 24
+batch_size <- 1000
+
+train_gen <- generator(
+  train_data_pc,
+  lookback = lookback,
+  delay = delay,
+  min_index = 1,
+  max_index = NULL,
+  shuffle = FALSE,
+  step = step, 
+  batch_size = batch_size
+)
+
+val_gen = generator(
+  val_data_pc,
+  lookback = lookback,
+  delay = delay,
+  min_index = 1,
+  max_index = NULL,
+  shuffle = FALSE,
+  step = step,
+  batch_size = batch_size
+)
+
+# How many steps to draw from val_gen in order to see the entire validation set
+val_steps <- round((nrow(val_data_pc) - lookback) / batch_size)
+
+# How many steps to draw from test_gen in order to see the entire test set
+test_steps <- round((nrow(test_data_pc) - lookback) / batch_size)
+
+evaluate_naive_method <- function() {
+  batch_maes <- c()
+  for (step in 1:val_steps) {
+    c(samples, targets) %<-% val_gen()
+    preds <- samples[,dim(samples)[[2]],2]
+    mae <- mean(abs(preds - targets))
+    batch_maes <- c(batch_maes, mae)
+  }
+  print(mean(batch_maes))
+}
+
+evaluate_naive_method()
+
+
+#kWh_mae <- 0.47 * val_std[[2]]
+
+
+
+
+#LSTM
+model <- keras_model_sequential() %>% 
+  layer_lstm(units = 64,
+             input_shape = list(NULL, dim(train_data_pc)[[-1]])) %>%
+  layer_dense(units = 32, activation = "relu") %>% 
+  layer_dense(units = 16, activation = "relu") %>% 
+  layer_dense(units = 1)
+
+model %>% compile(
+  optimizer = "adam",
+  loss = "mae"
+)
+
+history <- model %>% fit(
+  train_gen,
+  steps_per_epoch = 100,
+  epochs = 30,
+  validation_data = val_gen,
+  validation_steps = val_steps,
+) 
+
+#plot
+lookback <- 2
+step <- 1
+delay <- 24
+batch_size <- 2813
+
+test_gen <- generator(
+  test_data_pc,
+  lookback = lookback,
+  delay = delay,
+  min_index = 1,
+  max_index = NULL,
+  shuffle = FALSE,
+  step = step,
+  batch_size = batch_size
+)
+
+test_dt <- test_gen()
+
+V1 = seq(1, length(test_dt[[2]]))
+
+plot_data <-
+  as.data.frame(cbind(V1, test_dt[[2]]))
+
+inputdata <- test_dt[[1]][,,]
+
+
+pred_out <- model %>%
+  predict(inputdata)
+
+
+plot_data <-
+  cbind(plot_data, pred_out)
+
+p <-
+  ggplot(plot_data, aes(x = V1, y = V2)) + geom_line(colour = "blue", size = 0.5,alpha=0.4)
+p <-
+  p + geom_line(aes(x = V1, y = pred_out), colour = "red", size = 0.5 ,alpha=0.4)
+
+p
+
+##result
+library(MLmetrics)
+
+pred <- plot_data[,3]
+ob <- plot_data[,2]
+
+MAPE(pred,ob)
+RMSE(pred,ob)
+
+write.csv(plot_data, "data/house153.csv", row.names = FALSE)
+
+
+require(tidyverse)
+require(tidyr)
+require(ggplot2)
+require(dplyr)
+require(lubridate)
+require(MLmetrics) # for MAPE
+require(Metrics) # for RMSE
+
+read_data <- function(){
+  # Read in data ------------------------------------------------------------
+  # This is same df_merge from the 'cleaning_data.R'
+  df <- read.csv("data/df_merge.csv")
+  
+  # get the id of the house, so we can double check which house we are using
+  house_id <<- df$LCLid[1]
+  
+  print(paste("ID: ", house_id))
+  df <- df %>%
+    select(-'LCLid')
+  
+  # check if need to deal with NAs
+  print(paste("Number of NA: ", sum(is.na(df))))
+  
+  # first date
+  print(paste("first date: ", head(df$date, 1)))
+  # last date
+  print(paste("last date: ", tail(df$date, 1)))
+  
+  return(df)
+  
+}
+
+
+# Train / Test split ------------------------------------------------------
+train_test_split <- function(df, start_date, end_date){
+  if (start_date == "auto"){
+    train_start_date <- df[1,]$date
+  } else {
+    train_start_date <- start_date
+  }
+  
+  train_end_date = end_date
+  
+  
+  # split data into training based on the split dates
+  pca.train <- df %>%
+    filter( train_start_date <= date  & date < train_end_date)
+  
+  pca.test <- df %>%
+    filter(date >= train_end_date)
+  
+  test_preds_dates <- pca.test$date
+  
+  print(paste("Number of test hour predictions: ", length(test_preds_dates)))
+  return(list(pca.train = pca.train, pca.test = pca.test))
+  
+}
+
+# PCA ---------------------------------------------------------------------
+train_pca <- function(training_df){
+  # compute Principal Components based on the training set
+  pca.train <- training_df %>%
+    select(-'date')
+  
+  prin_comp <- prcomp(pca.train, scale. = T)
+  
+  # Want to find variance of each principal component, so we know how many components to select
+  std_dev <- prin_comp$sdev # gives standard deviation
+  pr_var <- std_dev^2
+  prop_varex <- pr_var/sum(pr_var) #find proportion of variance each principal component holds
+  
+  cum_prop_var <- cumsum(prop_varex)
+  print('Cumulative proportion of variance')
+  print(cum_prop_var)
+  
+  print(paste("Chosen num of PCA: ", min(which(cum_prop_var > 0.9))))
+  
+  return(list(prin_comp = prin_comp,
+              num_pca = min(which(cum_prop_var > 0.9)))) # Choose number of PCA coomponents explains 90% of variance
+}
+
+
+get_train_test_pc <- function(num_pc, train_df, prin_comp, pca.test){
+  # transforming traing data using principal components calculated on test data
+  train.data <- data.frame(energy_kWh = train_df$energy_kWh, prin_comp$x[, 1:num_pc])
+  
+  # transforming test data using principal components calculated on test data
+  pca.test <- pca.test %>%
+    select(-'date')
+  
+  test.prin_comp <- predict(prin_comp, newdata = pca.test)
+  test.data <- data.frame(energy_kWh = pca.test$energy_kWh, test.prin_comp[, 1:num_pc])
+  
+  return(list(train.data = train.data,
+              test.data = test.data))
+}
+
+
+
+# Linear regression -------------------------------------------------------
+prediction_models <- function(train.data, test.data){
+  
+  linear_model <- lm(energy_kWh ~ ., train.data)
+  
+  linear_train_preds <- train.data %>%
+    transmute(actual = energy_kWh,
+              linear_model = predict(linear_model, .))
+  
+  linear_test_preds <- test.data %>%
+    transmute(actual = energy_kWh,
+              linear_model = predict(linear_model, .))
+  
+  return(list(l_train_preds = linear_train_preds,
+              l_test_preds = linear_test_preds))
+  
+}
+
+
+# Evalution metrics -------------------------------------------------------
+eval_results <- function(true, predicted, df) {
+  SSE <- sum((predicted - true)^2)
+  SST <- sum((true - mean(true))^2)
+  R_square <- 1 - SSE / SST
+  
+  RMSE = sqrt(SSE/nrow(df))
+  
+  MAPE = MAPE(predicted, true)
+  
+  data.frame(
+    RMSE = RMSE,
+    Rsquare = R_square,
+    MAPE = MAPE
+  )
+}
+
+
+# Main --------------------------------------------------------------------
+house_id <- 'x'
+df <- read_data()
+pca_splits <- train_test_split(df, "auto", "2014-02-21")
+pca_info <- train_pca(pca_splits$pca.train)
+p_components <- get_train_test_pc(pca_info$num_pca+1, pca_splits$pca.train, pca_info$prin_comp, pca_splits$pca.test)
+preds <- prediction_models(p_components$train.data, p_components$test.data)
+
+eval_results(preds$l_train_preds$actual, preds$l_train_preds$linear_model, pca_splits$pca.train)
+eval_results(preds$l_test_preds$actual, preds$l_test_preds$linear_model, pca_splits$pca.test)
+
+preds$l_test_preds <- preds$l_test_preds %>%
+  transmute(date = lubridate::ymd_hms(pca_splits$pca.test$date),
+            actual = actual,
+            linear_model = linear_model)
+
+write.csv(preds$l_test_preds, paste0("data/pred_", house_id, ".csv"))
+
+ggplot(data=preds$l_test_preds, mapping = aes(x = date, y = actual)) +
+  geom_line() +
+  geom_point(data=preds$l_test_preds, mapping = aes(x = date, y = linear_model) ,colour='red') +
+  labs(title="Household Energy Consumption",
+       subtitle=paste("House:", house_id),
+       y="Energy Consumption (kWh)",
+       x="Date",
+       legend="test" )+
+  theme(axis.text=element_text(size=15),
+        axis.title =element_text(size=15),
+        plot.title=element_text(size=25),
+  )
